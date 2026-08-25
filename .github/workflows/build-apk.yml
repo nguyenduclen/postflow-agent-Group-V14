@@ -12,6 +12,7 @@ jobs:
   build:
     name: Build PostFlow Agent V14
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -32,36 +33,125 @@ jobs:
           yes | sdkmanager --licenses >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
 
+      - name: Locate V14 Android source
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ROOT="$GITHUB_WORKSPACE"
+          WORK="$RUNNER_TEMP/postflow-v14"
+          rm -rf "$WORK"
+          mkdir -p "$WORK"
+
+          echo "=== Repository Android sources / ZIPs ==="
+          find "$ROOT" -type f \
+            ! -path '*/.git/*' \
+            \( -name 'settings.gradle' -o -name 'settings.gradle.kts' -o -iname '*PostFlow-Agent*V14*.zip' \) \
+            -print | sort
+
+          # 1) Prefer a real Android project already checked into the repository.
+          SETTINGS="$(find "$ROOT" -type f \
+            \( -name settings.gradle -o -name settings.gradle.kts \) \
+            ! -path '*/.git/*' \
+            ! -path '*/build/*' \
+            ! -path '*/.gradle/*' \
+            -print | while read -r f; do
+              D="$(dirname "$f")"
+              if [ -f "$D/app/build.gradle" ] || [ -f "$D/app/build.gradle.kts" ]; then
+                echo "$f"
+                break
+              fi
+            done)"
+
+          if [ -n "$SETTINGS" ]; then
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+            echo "Using Android project: $PROJECT_DIR"
+          else
+            # 2) Otherwise find the V14 source ZIP and extract it.
+            ZIP="$(find "$ROOT" -type f \
+              \( \
+                -iname 'PostFlow-Agent-V14-MEMBERSHIP-FIRST.zip' \
+                -o -iname '*PostFlow-Agent*V14*MEMBERSHIP-FIRST*.zip' \
+                -o -iname '*PostFlow-Agent*V14*.zip' \
+              \) \
+              ! -path '*/.git/*' \
+              -print | sort | head -n 1)"
+
+            if [ -z "$ZIP" ]; then
+              echo "::error::Không tìm thấy source Android V14. Cần project Android hoặc PostFlow-Agent V14 ZIP."
+              exit 1
+            fi
+
+            echo "Using source ZIP: $ZIP"
+            unzip -q -o "$ZIP" -d "$WORK"
+
+            SETTINGS="$(find "$WORK" -type f \
+              \( -name settings.gradle -o -name settings.gradle.kts \) \
+              -print | while read -r f; do
+                D="$(dirname "$f")"
+                if [ -f "$D/app/build.gradle" ] || [ -f "$D/app/build.gradle.kts" ]; then
+                  echo "$f"
+                  break
+                fi
+              done)"
+
+            if [ -z "$SETTINGS" ]; then
+              echo "::error::ZIP V14 không chứa Android project hợp lệ."
+              exit 1
+            fi
+
+            PROJECT_DIR="$(dirname "$SETTINGS")"
+          fi
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Android project resolved to: $PROJECT_DIR"
+
       - name: Verify V14 source
         shell: bash
         run: |
           set -euo pipefail
-          P="$GITHUB_WORKSPACE"
-          test -f "$P/settings.gradle"
-          test -f "$P/app/build.gradle"
+
+          P="$PROJECT_DIR"
+          test -f "$P/settings.gradle" || test -f "$P/settings.gradle.kts"
+          test -f "$P/app/build.gradle" || test -f "$P/app/build.gradle.kts"
           test -f "$P/app/src/main/AndroidManifest.xml"
+
           SERVICE="$P/app/src/main/java/vn/phutungmaykubota/postflowagent/PostFlowAccessibilityService.java"
           PROVIDER="$P/app/src/main/java/vn/phutungmaykubota/postflowagent/GroupMembershipProvider.java"
+          MAIN="$P/app/src/main/java/vn/phutungmaykubota/postflowagent/MainActivity.java"
+          SYNC="$P/app/src/main/java/vn/phutungmaykubota/postflowagent/AgentSync.java"
+
           test -f "$SERVICE"
           test -f "$PROVIDER"
+          test -f "$MAIN"
+          test -f "$SYNC"
+
           grep -q "versionCode 54" "$P/app/build.gradle"
           grep -q "V14-MEMBERSHIP-FIRST-GROUP-SCAN" "$P/app/build.gradle"
           grep -q "GroupMembershipProvider" "$SERVICE"
           grep -q "agent_group_membership.php" "$PROVIDER"
-          if grep -q "collectGroupEntriesFromTree\|collectGroupsFromFacebookScreen\|autoOpenAndCollectPageGroups\|autoOpenAndCollectProfileGroups" "$SERVICE"; then
-            echo "::error::V14 still contains legacy screen/text Group scanner"
+
+          # V14 MUST NOT fall back to the old screen/text Group scanner.
+          if grep -Eq \
+            "collectGroupEntriesFromTree|collectGroupsFromFacebookScreen|autoOpenAndCollectPageGroups|autoOpenAndCollectProfileGroups" \
+            "$SERVICE"; then
+            echo "::error::V14 vẫn chứa legacy screen/text Group scanner."
             exit 1
           fi
-          echo "V14 SOURCE CHECK OK"
+
+          echo "=== V14 SOURCE CHECK OK ==="
+          echo "Membership-first provider: OK"
+          echo "Legacy screen/text scanner: NOT FOUND"
 
       - name: Validate XML
         shell: bash
         run: |
           set -euo pipefail
-          python3 - "$GITHUB_WORKSPACE/app/src/main" <<'PY'
+          python3 - "$PROJECT_DIR/app/src/main" <<'PY'
           import sys
           from pathlib import Path
           import xml.etree.ElementTree as ET
+
           root = Path(sys.argv[1])
           for p in root.rglob("*.xml"):
               ET.parse(p)
@@ -75,21 +165,37 @@ jobs:
           cache-disabled: true
 
       - name: Build Debug APK
-        working-directory: ${{ github.workspace }}
+        working-directory: ${{ env.PROJECT_DIR }}
         shell: bash
         run: |
           set -euxo pipefail
-          gradle --no-daemon --stacktrace clean assembleDebug
+
+          if [ -f ./gradlew ]; then
+            chmod +x ./gradlew
+            ./gradlew --no-daemon --stacktrace clean assembleDebug
+          else
+            gradle --no-daemon --stacktrace clean assembleDebug
+          fi
 
       - name: Collect APK
         shell: bash
         run: |
           set -euxo pipefail
-          APK="$(find "$GITHUB_WORKSPACE/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
+
+          APK="$(find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+            -type f -name '*.apk' -print -quit)"
+
           test -n "$APK"
+
           mkdir -p "$GITHUB_WORKSPACE/final-apk"
-          cp "$APK" "$GITHUB_WORKSPACE/final-apk/PostFlow-Agent-V14-MEMBERSHIP-FIRST.apk"
-          unzip -t "$GITHUB_WORKSPACE/final-apk/PostFlow-Agent-V14-MEMBERSHIP-FIRST.apk" >/dev/null
+
+          cp "$APK" \
+            "$GITHUB_WORKSPACE/final-apk/PostFlow-Agent-V14-MEMBERSHIP-FIRST.apk"
+
+          unzip -t \
+            "$GITHUB_WORKSPACE/final-apk/PostFlow-Agent-V14-MEMBERSHIP-FIRST.apk" \
+            >/dev/null
+
           ls -lh "$GITHUB_WORKSPACE/final-apk/"
 
       - name: Upload APK
