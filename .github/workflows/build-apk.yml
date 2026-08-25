@@ -1,0 +1,101 @@
+name: Build PostFlow Agent V14 Membership First
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build PostFlow Agent V14
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK 35
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Verify V14 source
+        shell: bash
+        run: |
+          set -euo pipefail
+          P="$GITHUB_WORKSPACE"
+          test -f "$P/settings.gradle"
+          test -f "$P/app/build.gradle"
+          test -f "$P/app/src/main/AndroidManifest.xml"
+          SERVICE="$P/app/src/main/java/vn/phutungmaykubota/postflowagent/PostFlowAccessibilityService.java"
+          PROVIDER="$P/app/src/main/java/vn/phutungmaykubota/postflowagent/GroupMembershipProvider.java"
+          test -f "$SERVICE"
+          test -f "$PROVIDER"
+          grep -q "versionCode 54" "$P/app/build.gradle"
+          grep -q "V14-MEMBERSHIP-FIRST-GROUP-SCAN" "$P/app/build.gradle"
+          grep -q "GroupMembershipProvider" "$SERVICE"
+          grep -q "agent_group_membership.php" "$PROVIDER"
+          if grep -q "collectGroupEntriesFromTree\|collectGroupsFromFacebookScreen\|autoOpenAndCollectPageGroups\|autoOpenAndCollectProfileGroups" "$SERVICE"; then
+            echo "::error::V14 still contains legacy screen/text Group scanner"
+            exit 1
+          fi
+          echo "V14 SOURCE CHECK OK"
+
+      - name: Validate XML
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "$GITHUB_WORKSPACE/app/src/main" <<'PY'
+          import sys
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path(sys.argv[1])
+          for p in root.rglob("*.xml"):
+              ET.parse(p)
+              print("XML OK:", p)
+          PY
+
+      - name: Gradle 8.7
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+          cache-disabled: true
+
+      - name: Build Debug APK
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euxo pipefail
+          gradle --no-daemon --stacktrace clean assembleDebug
+
+      - name: Collect APK
+        shell: bash
+        run: |
+          set -euxo pipefail
+          APK="$(find "$GITHUB_WORKSPACE/app/build/outputs/apk/debug" -type f -name '*.apk' -print -quit)"
+          test -n "$APK"
+          mkdir -p "$GITHUB_WORKSPACE/final-apk"
+          cp "$APK" "$GITHUB_WORKSPACE/final-apk/PostFlow-Agent-V14-MEMBERSHIP-FIRST.apk"
+          unzip -t "$GITHUB_WORKSPACE/final-apk/PostFlow-Agent-V14-MEMBERSHIP-FIRST.apk" >/dev/null
+          ls -lh "$GITHUB_WORKSPACE/final-apk/"
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: PostFlow-Agent-V14-MEMBERSHIP-FIRST
+          path: final-apk/PostFlow-Agent-V14-MEMBERSHIP-FIRST.apk
+          if-no-files-found: error
+          retention-days: 30
